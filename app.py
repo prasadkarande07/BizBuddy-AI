@@ -1,90 +1,292 @@
-from flask import Flask,request,redirect,session,render_template_string
-import sqlite3,os,pandas as pd,numpy as np
+import os
+from datetime import datetime
+from functools import wraps
+
+import numpy as np
+import pandas as pd
+from flask import Flask, request, redirect, url_for, session, flash, render_template_string
+from sqlalchemy import create_engine, text
+from werkzeug.security import generate_password_hash, check_password_hash
 from sklearn.ensemble import IsolationForest
-app=Flask(__name__);app.secret_key=os.getenv('SECRET_KEY','bizbuddy-secret-2026');DB='bizbuddy.db'
-def db():
- c=sqlite3.connect(DB);c.row_factory=sqlite3.Row;return c
-def init():
- c=db();c.executescript('''CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,username TEXT UNIQUE,password TEXT,mode TEXT DEFAULT "professional");CREATE TABLE IF NOT EXISTS sales(id INTEGER PRIMARY KEY,date TEXT,product TEXT,quantity REAL,price REAL,revenue REAL);CREATE TABLE IF NOT EXISTS expenses(id INTEGER PRIMARY KEY,date TEXT,category TEXT,amount REAL);CREATE TABLE IF NOT EXISTS inventory(id INTEGER PRIMARY KEY,product TEXT,stock REAL,reorder_level REAL);''');c.execute("INSERT OR IGNORE INTO users(username,password) VALUES('admin','BizBuddy@2026')");c.commit();c.close()
-def sales():
- c=db();d=pd.read_sql_query('SELECT * FROM sales',c);c.close();
- if not d.empty:d.date=pd.to_datetime(d.date);d.revenue=pd.to_numeric(d.revenue,errors='coerce').fillna(0)
- return d
-def exp():
- c=db();d=pd.read_sql_query('SELECT * FROM expenses',c);c.close();return d
-def inv():
- c=db();d=pd.read_sql_query('SELECT * FROM inventory',c);c.close();return d
-def analysis():
- s,e,i=sales(),exp(),inv();r=float(s.revenue.sum()) if not s.empty else 0;x=float(e.amount.sum()) if not e.empty else 0;low=int((i.stock<=i.reorder_level).sum()) if not i.empty else 0;best=s.groupby('product').revenue.sum().idxmax() if not s.empty else 'No data';return r,x,r-x,low,best
-def forecast():
- s=sales()
- if s.empty:return 0
- d=s.groupby('date').revenue.sum().sort_index().tail(7)
- if len(d)<3:return float(d.mean())
- m,b=np.polyfit(np.arange(len(d)),d.values,1);return max(0,float(m*len(d)+b))
-def anomalies():
- s=sales()
- if len(s)<5:return []
- d=s.groupby('date').revenue.sum().reset_index()
- if len(d)<5:return []
- d['p']=IsolationForest(contamination='auto',random_state=42).fit_predict(d[['revenue']]);return d[d.p==-1].to_dict('records')
-def agent():
- r,e,p,low,best=analysis();a=anomalies();rec=[];alerts=[]
- if low:rec.append('Replenish low-stock products before they affect sales.');alerts.append(('Low Inventory Detected',f'{low} product(s) are at or below reorder level.','HIGH','Review inventory and place a restocking order.'))
- if a:rec.append('Investigate unusual sales activity and related dates/products.');alerts.append(('Sales Anomaly Detected',f'{len(a)} unusual sales period(s) detected.','HIGH','Investigate the unusual sales pattern and prepare stock accordingly.'))
- if p<0:rec.append('Review major expenses because expenses exceed revenue.');alerts.append(('Negative Profit','Recorded expenses are higher than revenue.','CRITICAL','Review pricing and unnecessary expenses.'))
- if not rec:rec=['Business activity looks stable. Continue monitoring sales, expenses and inventory.']
- return rec,alerts,forecast(),a
-CSS='''*{box-sizing:border-box}body{margin:0;font-family:Arial;background:#f4f7fb;color:#172033}nav{background:#111827;color:white;padding:18px 30px;display:flex;justify-content:space-between}nav a{color:white;margin-left:18px;text-decoration:none}.wrap{max-width:1200px;margin:30px auto;padding:0 20px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:18px}.card,.panel{background:white;border-radius:15px;padding:22px;box-shadow:0 4px 15px #0001}.panel{margin-top:22px}.value{font-size:28px;font-weight:bold;margin-top:8px}.muted{color:#667085}.alert{border-left:5px solid #ef4444;padding:15px;margin:12px 0;background:#fff5f5;border-radius:8px}input,select,button{width:100%;padding:12px;margin:7px 0 14px;border-radius:8px}button{background:#2563eb;color:white;border:0;cursor:pointer}.login{max-width:400px;margin:100px auto}.badge{padding:5px 9px;background:#fee2e2;color:#991b1b;border-radius:15px}'''
-PAGE='''<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>BizBuddy AI</title><style>'''+CSS+'''</style></head><body><nav><b>🤖 BizBuddy AI</b>{%if session.get('user')%}<span><a href="/dashboard">Dashboard</a><a href="/upload">Upload</a><a href="/alerts">Alerts</a><a href="/mode">Mode</a><a href="/logout">Logout</a></span>{%endif%}</nav><main class="wrap">{{content|safe}}</main></body></html>'''
-def page(x):return render_template_string(PAGE,content=x)
-@app.route('/',methods=['GET','POST'])
+
+app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "change-this-secret-key-before-deployment")
+
+# Render Postgres is used when DATABASE_URL is set; SQLite is the local fallback.
+DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///bizbuddy.db")
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
+elif DATABASE_URL.startswith("postgresql://") and "+psycopg" not in DATABASE_URL:
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
+
+def init_db():
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                username VARCHAR(120) UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL
+            )
+        """) if not DATABASE_URL.startswith("sqlite") else text("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL
+            )
+        """))
+        for table_sql in [
+            """CREATE TABLE IF NOT EXISTS sales (
+                id INTEGER PRIMARY KEY, date TEXT, product TEXT, quantity DOUBLE PRECISION, price DOUBLE PRECISION
+            )""",
+            """CREATE TABLE IF NOT EXISTS expenses (
+                id INTEGER PRIMARY KEY, date TEXT, category TEXT, amount DOUBLE PRECISION
+            )""",
+            """CREATE TABLE IF NOT EXISTS inventory (
+                id INTEGER PRIMARY KEY, product TEXT, stock DOUBLE PRECISION, reorder_level DOUBLE PRECISION
+            )"""
+        ]:
+            if DATABASE_URL.startswith("sqlite"):
+                table_sql = table_sql.replace("DOUBLE PRECISION", "REAL")
+            conn.execute(text(table_sql))
+        username = os.environ.get("ADMIN_USERNAME", "admin")
+        password = os.environ.get("ADMIN_PASSWORD", "BizBuddy@2026")
+        exists = conn.execute(text("SELECT id FROM users WHERE username=:u"), {"u": username}).first()
+        if not exists:
+            conn.execute(
+                text("INSERT INTO users (username, password_hash) VALUES (:u, :p)"),
+                {"u": username, "p": generate_password_hash(password)}
+            )
+
+init_db()
+
+BASE_STYLE = """
+*{box-sizing:border-box}body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:#f3f6fb;color:#152238}
+a{color:inherit;text-decoration:none}.nav{height:58px;background:#111827;color:#fff;display:flex;align-items:center;justify-content:space-between;padding:0 5%;gap:16px}
+.brand{font-weight:800;letter-spacing:.2px}.navlinks{display:flex;gap:18px;flex-wrap:wrap;font-size:14px}.navlinks a:hover{color:#9fc5ff}
+.wrap{max-width:1120px;margin:28px auto;padding:0 20px}.muted{color:#64748b}.card{background:white;border-radius:16px;padding:22px;box-shadow:0 6px 20px #182b4810;margin-bottom:18px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:15px}.metric{background:#fff;border-radius:16px;padding:19px;box-shadow:0 5px 18px #182b480d}.metric small{display:block;color:#64748b;margin-bottom:8px}.metric strong{font-size:25px}
+h1{font-size:29px;margin:0 0 10px}h2{font-size:20px;margin:0 0 17px}p{line-height:1.5}
+.btn{display:inline-block;border:0;border-radius:10px;background:#2563eb;color:white;padding:11px 16px;font-weight:700;cursor:pointer}.btn:hover{background:#1d4ed8}.btn.secondary{background:#e8eef8;color:#183153}
+input,select{width:100%;padding:12px 13px;border:1px solid #d7deea;border-radius:10px;font:inherit;background:white}label{display:block;font-weight:650;font-size:13px;margin:14px 0 7px}
+.formrow{display:grid;grid-template-columns:1fr 1fr;gap:14px}.flash{padding:12px 14px;background:#fff7ed;border-left:4px solid #f59e0b;border-radius:8px;margin-bottom:12px}
+.alert{padding:14px 16px;border-left:4px solid #e05252;background:#fff5f5;border-radius:10px;margin:10px 0}.alert.medium{border-color:#f59e0b;background:#fffbeb}
+.pill{display:inline-block;padding:4px 9px;border-radius:99px;background:#fee2e2;color:#991b1b;font-size:12px;font-weight:700}
+.login-bg{min-height:100vh;background:radial-gradient(circle at 15% 15%,#dbeafe 0,transparent 32%),linear-gradient(135deg,#f8fafc,#eaf0fa);display:grid;grid-template-columns:1.1fr .9fr;align-items:center;padding:5vw;gap:5vw}
+.login-copy h1{font-size:clamp(32px,4vw,54px);line-height:1.08;max-width:560px}.login-copy p{font-size:17px;color:#64748b;max-width:480px}
+.login-card{max-width:430px;width:100%;justify-self:center;padding:32px;border-radius:22px;background:#fff;box-shadow:0 22px 70px #172b4d1c}
+.logo-mark{display:inline-grid;place-items:center;background:#2563eb;color:white;width:43px;height:43px;border-radius:13px;font-size:22px;margin-bottom:18px}
+@media(max-width:720px){.login-bg{grid-template-columns:1fr;padding:26px}.login-copy{display:none}.nav{padding:0 16px;height:auto;min-height:58px}.navlinks{gap:10px}.formrow{grid-template-columns:1fr}}
+"""
+
+LOGIN = """<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in · BizBuddy AI</title><style>""" + BASE_STYLE + """</style></head>
+<body><main class="login-bg"><section class="login-copy"><div class="logo-mark">✦</div><p style="font-weight:800;color:#2563eb;letter-spacing:2px;text-transform:uppercase;font-size:12px">BizBuddy AI</p><h1>Make smarter business decisions, every day.</h1><p>Your business data, translated into clear insights, inventory warnings and practical next steps.</p><p>✓ Sales and expense analytics &nbsp; ✓ Stock alerts &nbsp; ✓ Business insights</p></section>
+<section class="login-card"><div class="logo-mark">✦</div><h2 style="font-size:26px;margin-bottom:6px">Welcome back</h2><p class="muted" style="margin-top:0">Sign in to your business workspace.</p>
+{% with messages=get_flashed_messages() %}{% for message in messages %}<div class="flash">{{message}}</div>{% endfor %}{% endwith %}
+<form method="post"><label for="username">Username</label><input id="username" name="username" autocomplete="username" placeholder="Enter your username" required>
+<label for="password">Password</label><input id="password" type="password" name="password" autocomplete="current-password" placeholder="Enter your password" required>
+<button class="btn" style="width:100%;margin-top:22px" type="submit">Sign in securely →</button></form>
+<p class="muted" style="font-size:12px;margin-top:22px">Secure access to your business dashboard.</p></section></main></body></html>"""
+
+LAYOUT = """<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>{{title}} · BizBuddy AI</title><style>""" + BASE_STYLE + """</style></head><body>
+<nav class="nav"><a class="brand" href="{{url_for('dashboard')}}">✦ BizBuddy AI</a><div class="navlinks"><a href="{{url_for('dashboard')}}">Dashboard</a><a href="{{url_for('upload')}}">Upload</a><a href="{{url_for('alerts')}}">Alerts</a><a href="{{url_for('mode')}}">Mode</a><a href="{{url_for('logout')}}">Logout</a></div></nav>
+<div class="wrap">{% with messages=get_flashed_messages() %}{% for message in messages %}<div class="flash">{{message}}</div>{% endfor %}{% endwith %}{{content|safe}}</div></body></html>"""
+
+def page(title, content, **context):
+    return render_template_string(LAYOUT, title=title, content=render_template_string(content, **context))
+
+def login_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if "user_id" not in session:
+            return redirect(url_for("login"))
+        return fn(*args, **kwargs)
+    return wrapper
+
+def read_table(table):
+    try:
+        with engine.connect() as conn:
+            return pd.read_sql(text(f"SELECT * FROM {table}"), conn)
+    except Exception:
+        return pd.DataFrame()
+
+def money(value):
+    try:
+        return "₹{:,.0f}".format(float(value))
+    except Exception:
+        return "₹0"
+
+def get_analysis():
+    sales = read_table("sales")
+    expenses = read_table("expenses")
+    inventory = read_table("inventory")
+    revenue = 0.0
+    anomalies = []
+    forecast = 0.0
+    if not sales.empty:
+        for col in ["quantity", "price"]:
+            sales[col] = pd.to_numeric(sales.get(col), errors="coerce").fillna(0)
+        sales["total"] = sales["quantity"] * sales["price"]
+        revenue = float(sales["total"].sum())
+        if "date" in sales.columns:
+            daily = sales.groupby("date", dropna=True)["total"].sum().sort_index()
+            if len(daily) >= 2:
+                forecast = max(0.0, float(daily.tail(min(7, len(daily))).mean()))
+            if len(sales) >= 5:
+                try:
+                    features = sales[["quantity", "price", "total"]].replace([np.inf, -np.inf], np.nan).fillna(0)
+                    model = IsolationForest(contamination="auto", random_state=42)
+                    flags = model.fit_predict(features)
+                    anomalies = sales.loc[flags == -1].to_dict("records")
+                except Exception:
+                    anomalies = []
+    expense_total = 0.0
+    if not expenses.empty and "amount" in expenses.columns:
+        expenses["amount"] = pd.to_numeric(expenses["amount"], errors="coerce").fillna(0)
+        expense_total = float(expenses["amount"].sum())
+    low_stock = []
+    if not inventory.empty and {"stock", "reorder_level"}.issubset(inventory.columns):
+        inventory["stock"] = pd.to_numeric(inventory["stock"], errors="coerce").fillna(0)
+        inventory["reorder_level"] = pd.to_numeric(inventory["reorder_level"], errors="coerce").fillna(0)
+        low_stock = inventory[inventory["stock"] <= inventory["reorder_level"]].to_dict("records")
+    recommendations = []
+    if low_stock:
+        recommendations.append(f"Replenish {len(low_stock)} low-stock product(s) before they affect sales.")
+    if anomalies:
+        recommendations.append("Investigate unusual sales activity and related dates/products.")
+    if expense_total > revenue:
+        recommendations.append("Review major expenses because expenses exceed revenue.")
+    if not recommendations:
+        recommendations.append("Keep tracking sales, expenses and stock to surface useful business patterns.")
+    return {"sales": sales, "expenses": expenses, "inventory": inventory, "revenue": revenue,
+            "expense_total": expense_total, "profit": revenue-expense_total, "forecast": forecast,
+            "low_stock": low_stock, "anomalies": anomalies, "recommendations": recommendations}
+
+@app.route("/", methods=["GET", "POST"])
 def login():
- if session.get('user'):return redirect('/dashboard')
- if request.method=='POST':
-  c=db();u=c.execute('SELECT * FROM users WHERE username=? AND password=?',(request.form['username'],request.form['password'])).fetchone();c.close()
-  if u:session['user']=u['username'];session['mode']=u['mode'];return redirect('/dashboard')
- return page('''<div class="panel login"><h1>🤖 BizBuddy AI</h1><p class="muted">Autonomous AI Business Analyst</p><form method="post"><input name="username" placeholder="Username" required><input type="password" name="password" placeholder="Password" required><button>Login</button></form><b>Demo:</b> admin / BizBuddy@2026</div>''')
-@app.route('/logout')
-def logout():session.clear();return redirect('/')
-@app.route('/dashboard')
+    if "user_id" in session:
+        return redirect(url_for("dashboard"))
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+        with engine.connect() as conn:
+            user = conn.execute(text("SELECT id, username, password_hash FROM users WHERE username=:u"), {"u": username}).mappings().first()
+        if user and check_password_hash(user["password_hash"], password):
+            session.clear()
+            session["user_id"] = user["id"]
+            session["username"] = user["username"]
+            return redirect(url_for("dashboard"))
+        flash("The username or password is incorrect. Please try again.")
+    return render_template_string(LOGIN)
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+@app.route("/dashboard")
+@login_required
 def dashboard():
- if not session.get('user'):return redirect('/')
- r,e,p,low,best=analysis();rec,alerts,f,a=agent();mode=session.get('mode','professional')
- if mode=='simple':
-  x=f'<h1>Good Morning 👋</h1><p class="muted">Simple Business Mode</p><div class="cards"><div class="card">Sales<div class="value">₹{r:,.0f}</div></div><div class="card">Expenses<div class="value">₹{e:,.0f}</div></div><div class="card">Earnings<div class="value">₹{p:,.0f}</div></div><div class="card">Best Seller<div class="value">{best}</div></div></div><div class="panel"><h2>🤖 BizBuddy Suggests</h2>'+''.join('<p>💡 '+z+'</p>' for z in rec)+'</div>'
- else:
-  x=f'<h1>BizBuddy AI Dashboard</h1><p class="muted">Professional Mode — Autonomous Business Intelligence</p><div class="cards"><div class="card">Revenue<div class="value">₹{r:,.0f}</div></div><div class="card">Expenses<div class="value">₹{e:,.0f}</div></div><div class="card">Profit<div class="value">₹{p:,.0f}</div></div><div class="card">Forecast<div class="value">₹{f:,.0f}</div></div><div class="card">Low Stock<div class="value">{low}</div></div><div class="card">Anomalies<div class="value">{len(a)}</div></div></div><div class="panel"><h2>🤖 Autonomous AI Agent</h2>'+''.join('<p>💡 <b>Recommendation:</b> '+z+'</p>' for z in rec)+'</div>'
-  if alerts:x+='<div class="panel"><h2>🚨 Proactive Alerts</h2>'+''.join(f'<div class="alert"><b>{t}</b><p>{m}</p><p><b>Action:</b> {q}</p><span class="badge">{s}</span></div>' for t,m,s,q in alerts)+'</div>'
- return page(x)
-@app.route('/upload',methods=['GET','POST'])
+    a = get_analysis()
+    mode = session.get("mode", "Professional")
+    metrics = f"""
+    <h1>BizBuddy AI Dashboard</h1><p class="muted">{mode} Mode — Autonomous Business Intelligence</p>
+    <div class="grid">
+      <div class="metric"><small>Revenue</small><strong>{money(a['revenue'])}</strong></div>
+      <div class="metric"><small>Expenses</small><strong>{money(a['expense_total'])}</strong></div>
+      <div class="metric"><small>Profit</small><strong>{money(a['profit'])}</strong></div>
+      <div class="metric"><small>Next-period sales estimate</small><strong>{money(a['forecast'])}</strong></div>
+      <div class="metric"><small>Low Stock</small><strong>{len(a['low_stock'])}</strong></div>
+      <div class="metric"><small>Anomalies</small><strong>{len(a['anomalies'])}</strong></div>
+    </div>
+    <section class="card" style="margin-top:20px"><h2>🤖 Autonomous AI Agent</h2>
+    {''.join('<p>💡 <b>Recommendation:</b> '+r+'</p>' for r in a['recommendations'])}</section>
+    <section class="card"><h2>🚨 Proactive Alerts</h2>
+    {''.join('<div class="alert"><b>Low Inventory Detected</b><p>'+str(len(a['low_stock']))+' product(s) are at or below reorder level.</p><b>Action:</b> Review inventory and place a restocking order. <span class="pill">HIGH</span></div>' for _ in ([1] if a['low_stock'] else []))}
+    {''.join('<div class="alert"><b>Sales Anomaly Detected</b><p>'+str(len(a['anomalies']))+' unusual sales record(s) detected.</p><b>Action:</b> Check the dates, products and quantities to confirm whether these are genuine.</div>' for _ in ([1] if a['anomalies'] else []))}
+    {''.join('<div class="alert medium"><b>Expenses exceed revenue</b><p>Current recorded expenses are higher than recorded revenue.</p><b>Action:</b> Review costs and verify the selected reporting period.</div>' for _ in ([1] if a['expense_total'] > a['revenue'] else []))}
+    {('<p class="muted">No alerts currently detected.</p>' if not a['low_stock'] and not a['anomalies'] and a['expense_total'] <= a['revenue'] else '')}
+    </section>"""
+    return page("Dashboard", metrics)
+
+@app.route("/upload", methods=["GET", "POST"])
+@login_required
 def upload():
- if not session.get('user'):return redirect('/')
- msg=''
- if request.method=='POST':
-  try:
-   f=request.files['file'];typ=request.form['type'];d=pd.read_csv(f);c=db()
-   if typ=='sales':
-    req=['date','product','quantity','price'];assert all(z in d.columns for z in req),'Sales CSV: date,product,quantity,price';d['date']=pd.to_datetime(d.date,errors='coerce');d['quantity']=pd.to_numeric(d.quantity,errors='coerce').fillna(0);d['price']=pd.to_numeric(d.price,errors='coerce').fillna(0);d=d.dropna(subset=['date']);d['revenue']=d.quantity*d.price
-    for _,z in d.iterrows():c.execute('INSERT INTO sales(date,product,quantity,price,revenue) VALUES(?,?,?,?,?)',(str(z.date.date()),str(z.product),float(z.quantity),float(z.price),float(z.revenue)))
-   elif typ=='expenses':
-    req=['date','category','amount'];assert all(z in d.columns for z in req),'Expenses CSV: date,category,amount';d['date']=pd.to_datetime(d.date,errors='coerce');d['amount']=pd.to_numeric(d.amount,errors='coerce').fillna(0);d=d.dropna(subset=['date'])
-    for _,z in d.iterrows():c.execute('INSERT INTO expenses(date,category,amount) VALUES(?,?,?)',(str(z.date.date()),str(z.category),float(z.amount)))
-   else:
-    req=['product','stock','reorder_level'];assert all(z in d.columns for z in req),'Inventory CSV: product,stock,reorder_level'
-    for _,z in d.iterrows():c.execute('INSERT INTO inventory(product,stock,reorder_level) VALUES(?,?,?)',(str(z.product),float(z.stock),float(z.reorder_level)))
-   c.commit();c.close();msg='Upload successful.'
-  except Exception as ex:msg='Upload error: '+str(ex)
- return page(f'''<h1>📤 Upload Data</h1><div class="panel"><form method="post" enctype="multipart/form-data"><select name="type"><option value="sales">Sales</option><option value="expenses">Expenses</option><option value="inventory">Inventory</option></select><input type="file" name="file" accept=".csv" required><button>Upload & Analyse</button></form><b>{msg}</b><hr><p>Sales: date,product,quantity,price</p><p>Expenses: date,category,amount</p><p>Inventory: product,stock,reorder_level</p></div>''')
-@app.route('/alerts')
-def alerts_page():
- if not session.get('user'):return redirect('/')
- _,a,_,_=agent();return page('<h1>🚨 Proactive Alerts</h1><div class="panel">'+(''.join(f'<div class="alert"><b>{t}</b><p>{m}</p><p><b>Action:</b> {q}</p><span class="badge">{s}</span></div>' for t,m,s,q in a) or '<p>No major alerts detected.</p>')+'</div>')
-@app.route('/mode',methods=['GET','POST'])
+    if request.method == "POST":
+        kind = request.form.get("kind", "")
+        file = request.files.get("file")
+        schemas = {"sales": ["date", "product", "quantity", "price"],
+                   "expenses": ["date", "category", "amount"],
+                   "inventory": ["product", "stock", "reorder_level"]}
+        if kind not in schemas or not file or not file.filename.lower().endswith(".csv"):
+            flash("Choose a data type and a valid CSV file.")
+            return redirect(url_for("upload"))
+        try:
+            df = pd.read_csv(file)
+            df.columns = [str(c).strip().lower() for c in df.columns]
+            missing = [c for c in schemas[kind] if c not in df.columns]
+            if missing:
+                flash("CSV is missing required columns: " + ", ".join(missing))
+                return redirect(url_for("upload"))
+            df = df[schemas[kind]].copy()
+            for col in df.columns:
+                if col in ("quantity", "price", "amount", "stock", "reorder_level"):
+                    df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+                else:
+                    df[col] = df[col].fillna("").astype(str)
+            # Replace each uploaded dataset atomically; uploaded records are now stored in the database.
+            with engine.begin() as conn:
+                conn.execute(text(f"DELETE FROM {kind}"))
+                for _, row in df.iterrows():
+                    cols = list(df.columns)
+                    values = {c: (None if pd.isna(row[c]) else row[c].item() if hasattr(row[c], "item") else row[c]) for c in cols}
+                    names = ", ".join(cols)
+                    binds = ", ".join(":" + c for c in cols)
+                    conn.execute(text(f"INSERT INTO {kind} ({names}) VALUES ({binds})"), values)
+            flash(f"Uploaded {len(df)} records to {kind}.")
+            return redirect(url_for("dashboard"))
+        except Exception as exc:
+            flash("Upload failed. Check the CSV format and try again.")
+    content = """
+    <h1>Upload Business Data</h1><p class="muted">Upload one CSV at a time. Each upload replaces the existing dataset of that type.</p>
+    <section class="card"><form method="post" enctype="multipart/form-data">
+    <label>Dataset type</label><select name="kind" required><option value="sales">Sales</option><option value="expenses">Expenses</option><option value="inventory">Inventory</option></select>
+    <label>CSV file</label><input type="file" name="file" accept=".csv" required>
+    <p class="muted" style="font-size:13px">Sales: date, product, quantity, price<br>Expenses: date, category, amount<br>Inventory: product, stock, reorder_level</p>
+    <button class="btn" type="submit">Upload and analyse</button></form></section>"""
+    return page("Upload", content)
+
+@app.route("/alerts")
+@login_required
+def alerts():
+    a = get_analysis()
+    items = []
+    if a["low_stock"]:
+        items.append(f"<div class='alert'><b>Low Inventory Detected</b><p>{len(a['low_stock'])} product(s) at or below reorder level.</p></div>")
+    if a["anomalies"]:
+        items.append(f"<div class='alert'><b>Sales Anomaly Detected</b><p>{len(a['anomalies'])} unusual record(s) found.</p></div>")
+    if a["expense_total"] > a["revenue"]:
+        items.append("<div class='alert medium'><b>Expense Warning</b><p>Expenses currently exceed revenue.</p></div>")
+    content = "<h1>Proactive Alerts</h1>" + ("".join(items) if items else "<section class='card'>No alerts detected from the currently uploaded data.</section>")
+    return page("Alerts", content)
+
+@app.route("/mode", methods=["GET", "POST"])
+@login_required
 def mode():
- if not session.get('user'):return redirect('/')
- if request.method=='POST':
-  m=request.form['mode'];c=db();c.execute('UPDATE users SET mode=? WHERE username=?',(m,session['user']));c.commit();c.close();session['mode']=m;return redirect('/dashboard')
- m=session.get('mode','professional');return page(f'<h1>⚙️ Business Mode</h1><div class="panel"><form method="post"><select name="mode"><option value="professional" {"selected" if m=="professional" else ""}>Professional Mode</option><option value="simple" {"selected" if m=="simple" else ""}>Simple Mode</option></select><button>Save Mode</button></form></div>')
-init()
-if __name__=='__main__':app.run(host='0.0.0.0',port=int(os.getenv('PORT',5000)),debug=True)
+    if request.method == "POST":
+        session["mode"] = request.form.get("mode", "Professional")
+        flash("Dashboard mode updated.")
+        return redirect(url_for("dashboard"))
+    current = session.get("mode", "Professional")
+    content = f"""
+    <h1>Choose Your Workspace Mode</h1><section class="card"><form method="post">
+    <label>Dashboard mode</label><select name="mode">
+    <option {'selected' if current == 'Professional' else ''}>Professional</option>
+    <option {'selected' if current == 'Simple' else ''}>Simple</option>
+    </select><p class="muted">Professional mode presents business metrics. Simple mode is intended for plain-language guidance.</p>
+    <button class="btn" type="submit">Save mode</button></form></section>"""
+    return page("Mode", content)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
